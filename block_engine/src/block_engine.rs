@@ -238,27 +238,27 @@ impl BlockEngineRelayerHandler {
             .connect()
             .await
             .map_err(|e| BlockEngineError::AuthServiceFailure(e.to_string()))?;
-        let mut auth_client = AuthServiceClient::new(channel);
+        // let mut auth_client = AuthServiceClient::new(channel);
 
-        let (access_token, mut refresh_token) = Self::auth(&mut auth_client, keypair).await?;
+        // let (access_token, mut refresh_token) = Self::auth(&mut auth_client, keypair).await?;
 
-        let access_token_expiration =
-            SystemTime::try_from(access_token.expires_at_utc.as_ref().unwrap().clone()).unwrap();
-        let refresh_token_expiration =
-            SystemTime::try_from(refresh_token.expires_at_utc.as_ref().unwrap().clone()).unwrap();
+        // let access_token_expiration =
+        //     SystemTime::try_from(access_token.expires_at_utc.as_ref().unwrap().clone()).unwrap();
+        // let refresh_token_expiration =
+        //     SystemTime::try_from(refresh_token.expires_at_utc.as_ref().unwrap().clone()).unwrap();
 
-        info!(
-            "access_token_expiration: {:?}, refresh_token_expiration: {:?}",
-            access_token_expiration
-                .duration_since(SystemTime::now())
-                .unwrap(),
-            refresh_token_expiration
-                .duration_since(SystemTime::now())
-                .unwrap()
-        );
+        // info!(
+        //     "access_token_expiration: {:?}, refresh_token_expiration: {:?}",
+        //     access_token_expiration
+        //         .duration_since(SystemTime::now())
+        //         .unwrap(),
+        //     refresh_token_expiration
+        //         .duration_since(SystemTime::now())
+        //         .unwrap()
+        // );
 
-        let shared_access_token = Arc::new(Mutex::new(access_token));
-        let auth_interceptor = AuthInterceptor::new(shared_access_token.clone());
+        // let shared_access_token = Arc::new(Mutex::new(access_token));
+        // let auth_interceptor = AuthInterceptor::new(shared_access_token.clone());
 
         let mut block_engine_endpoint =
             Endpoint::from_str(block_engine_url).expect("valid block engine url");
@@ -278,15 +278,14 @@ impl BlockEngineRelayerHandler {
             ("connected", 1, i64)
         );
 
-        let block_engine_client =
-            BlockEngineRelayerClient::with_interceptor(block_engine_channel, auth_interceptor);
+        let block_engine_client = BlockEngineRelayerClient::new(block_engine_channel);
         Self::start_event_loop(
             block_engine_client,
             block_engine_receiver,
-            auth_client,
+            // auth_client,
             keypair,
-            &mut refresh_token,
-            shared_access_token,
+            // &mut refresh_token,
+            // shared_access_token,
             exit,
             aoi_cache_ttl_s,
             address_lookup_table_cache,
@@ -303,12 +302,12 @@ impl BlockEngineRelayerHandler {
     /// try to re-establish connection
     #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
-        mut client: BlockEngineRelayerClient<InterceptedService<Channel, AuthInterceptor>>,
+        mut client: BlockEngineRelayerClient<Channel>,
         block_engine_receiver: &mut Receiver<BlockEnginePackets>,
-        auth_client: AuthServiceClient<Channel>,
+        // auth_client: AuthServiceClient<Channel>,
         keypair: &Arc<Keypair>,
-        refresh_token: &mut Token,
-        shared_access_token: Arc<Mutex<Token>>,
+        // refresh_token: &mut Token,
+        // shared_access_token: Arc<Mutex<Token>>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
@@ -337,10 +336,10 @@ impl BlockEngineRelayerHandler {
             block_engine_receiver,
             subscribe_aoi_stream,
             subscribe_poi_stream,
-            auth_client,
+            // auth_client,
             keypair,
-            refresh_token,
-            shared_access_token,
+            // refresh_token,
+            // shared_access_token,
             exit,
             aoi_cache_ttl_s,
             address_lookup_table_cache,
@@ -356,10 +355,10 @@ impl BlockEngineRelayerHandler {
         block_engine_receiver: &mut Receiver<BlockEnginePackets>,
         subscribe_aoi_stream: Response<Streaming<AccountsOfInterestUpdate>>,
         subscribe_poi_stream: Response<Streaming<ProgramsOfInterestUpdate>>,
-        mut auth_client: AuthServiceClient<Channel>,
+        // mut auth_client: AuthServiceClient<Channel>,
         keypair: &Arc<Keypair>,
-        refresh_token: &mut Token,
-        shared_access_token: Arc<Mutex<Token>>,
+        // refresh_token: &mut Token,
+        // shared_access_token: Arc<Mutex<Token>>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
@@ -424,7 +423,8 @@ impl BlockEngineRelayerHandler {
                     block_engine_stats.increment_poi_accounts_received(num_pubkeys as u64);
                 }
                 block_engine_batches = block_engine_receiver.recv() => {
-                    trace!("received block engine batches");
+                    info!("received block engine batches");
+                    // info!("Pograms of interest: {:?}", programs_of_interest.cache_get());
                     let block_engine_batches = block_engine_batches
                         .ok_or_else(|| BlockEngineError::BlockEngineFailure("block engine packet receiver disconnected".to_string()))?;
 
@@ -439,20 +439,22 @@ impl BlockEngineRelayerHandler {
 
                     if let Some(filtered_packets) = filtered_packets {
                         let now = Instant::now();
+                                info!("forwarding packets");
+
                         let packet_forward_count = Self::forward_packets(&block_engine_packet_sender, filtered_packets).await?;
                         block_engine_stats.increment_packet_forward_count(packet_forward_count as u64);
                         block_engine_stats.increment_packet_forward_elapsed_us(now.elapsed().as_micros() as u64);
                     }
                 }
                 _ = auth_refresh_interval.tick() => {
-                    trace!("refreshing auth interval");
-                    let now = Instant::now();
+                    // trace!("refreshing auth interval");
+                    // let now = Instant::now();
 
-                    let did_refresh = Self::maybe_refresh_auth(&mut auth_client, keypair, refresh_token, &shared_access_token).await?;
-                    if did_refresh {
-                        block_engine_stats.increment_auth_refresh_count(1);
-                    }
-                    block_engine_stats.increment_refresh_auth_elapsed_us(now.elapsed().as_micros() as u64);
+                    // let did_refresh = Self::maybe_refresh_auth(&mut auth_client, keypair, refresh_token, &shared_access_token).await?;
+                    // if did_refresh {
+                    //     block_engine_stats.increment_auth_refresh_count(1);
+                    // }
+                    // block_engine_stats.increment_refresh_auth_elapsed_us(now.elapsed().as_micros() as u64);
                 }
                 rx = metrics_interval.tick() => {
                     trace!("flushing metrics");
@@ -567,6 +569,7 @@ impl BlockEngineRelayerHandler {
                     .collect();
 
                 let num_pubkeys = pubkeys.len();
+                info!("Accounts of interest: {:?}", pubkeys);
 
                 pubkeys.into_iter().for_each(|pubkey| {
                     accounts_of_interest.cache_set(pubkey, 0);
@@ -594,6 +597,7 @@ impl BlockEngineRelayerHandler {
                     .collect();
 
                 let num_pubkeys = pubkeys.len();
+                info!("Programs of interest: {:?}", pubkeys);
 
                 pubkeys.into_iter().for_each(|pubkey| {
                     programs_of_interest.cache_set(pubkey, 0);

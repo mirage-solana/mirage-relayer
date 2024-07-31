@@ -18,6 +18,7 @@ use clap::Parser;
 use crossbeam_channel::tick;
 use dashmap::DashMap;
 use env_logger::Env;
+use forwarder::start_forward_and_delay_thread;
 use jito_block_engine::block_engine::{BlockEngineConfig, BlockEngineRelayerHandler};
 use jito_core::{
     graceful_panic,
@@ -35,7 +36,6 @@ use jito_relayer::{
 };
 use jito_relayer_web::{start_relayer_web_server, RelayerState};
 use jito_rpc::load_balancer::LoadBalancer;
-use jito_transaction_relayer::forwarder::start_forward_and_delay_thread;
 use jwt::{AlgorithmType, PKeyWithDigest};
 use log::{debug, error, info, warn};
 use openssl::{hash::MessageDigest, pkey::PKey};
@@ -52,10 +52,14 @@ use tikv_jemallocator::Jemalloc;
 use tokio::{runtime::Builder, signal, sync::mpsc::channel};
 use tonic::transport::Server;
 
+pub mod forwarder;
+
 // no-op change to test ci
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+pub type ClustersTpus = Arc<DashMap<Pubkey, (Option<SocketAddr>, Option<SocketAddr>)>>;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -236,6 +240,20 @@ struct Args {
     ///  Format of the file: `staked_map_id: {<pubkey>: <SOL stake amount>}
     #[arg(long, env)]
     staked_nodes_overrides: Option<PathBuf>,
+
+    /// Validator leader protection will only forward transactions that has been sent to you're relayer only when you're leader in provided offset
+    #[arg(long, env, default_value_t = false)]
+    validator_leader_protection: bool,
+
+    #[arg(long, env, default_value_t = 32)]
+    validator_leader_offset_before: u64,
+
+    #[arg(long, env, default_value_t = 32)]
+    validator_leader_offset_after: u64,
+
+    /// How frequently to refresh the address lookup table accounts
+    #[arg(long, env, default_value_t = 30)]
+    clusters_tpus_refresh_secs: u64,
 }
 
 #[derive(Debug)]
@@ -410,7 +428,7 @@ fn main() {
         .unwrap_or_default();
     info!("ofac addresses: {:?}", ofac_addresses);
 
-    let (rpc_load_balancer, slot_receiver) = LoadBalancer::new(&servers, &exit);
+    let (rpc_load_balancer, slot_receiver, current_slot) = LoadBalancer::new(&servers, &exit);
     let rpc_load_balancer = Arc::new(rpc_load_balancer);
 
     // Lookup table refresher
@@ -458,7 +476,20 @@ fn main() {
     // with packets when the block engine isn't connected
     // tracked as forwarder_metrics.block_engine_sender_len
     let (block_engine_sender, block_engine_receiver) =
-        channel(jito_transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
+        channel(forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
+
+    let validator_store = match args.allowed_validators {
+        Some(pubkeys) => ValidatorStore::UserDefined(HashSet::from_iter(pubkeys)),
+        None => ValidatorStore::LeaderSchedule(leader_cache.handle()),
+    };
+
+    let clusters_tpus_cache = Arc::new(DashMap::new());
+    let clusters_tpus_refresher = start_clusters_tpus_refresher(
+        &rpc_load_balancer,
+        &clusters_tpus_cache,
+        Duration::from_secs(args.clusters_tpus_refresh_secs),
+        &exit,
+    );
 
     let forward_and_delay_threads = start_forward_and_delay_thread(
         verified_receiver,
@@ -467,6 +498,12 @@ fn main() {
         block_engine_sender,
         1,
         args.disable_mempool,
+        validator_store.clone(),
+        clusters_tpus_cache,
+        current_slot,
+        args.validator_leader_offset_before,
+        args.validator_leader_offset_after,
+        args.validator_leader_protection,
         &exit,
     );
 
@@ -483,6 +520,7 @@ fn main() {
     } else {
         None
     };
+
     let block_engine_forwarder = BlockEngineRelayerHandler::new(
         block_engine_config,
         block_engine_receiver,
@@ -544,11 +582,6 @@ fn main() {
         key: PKey::public_key_from_pem(&key).unwrap(),
     });
 
-    let validator_store = match args.allowed_validators {
-        Some(pubkeys) => ValidatorStore::UserDefined(HashSet::from_iter(pubkeys)),
-        None => ValidatorStore::LeaderSchedule(leader_cache.handle()),
-    };
-
     let relayer_state = Arc::new(RelayerState::new(
         health_manager.handle(),
         &is_connected_to_block_engine,
@@ -594,14 +627,15 @@ fn main() {
     });
 
     exit.store(true, Ordering::Relaxed);
-
     tpu.join().unwrap();
     health_manager.join().unwrap();
     leader_cache.join().unwrap();
+
     for t in forward_and_delay_threads {
         t.join().unwrap();
     }
     lookup_table_refresher.join().unwrap();
+    clusters_tpus_refresher.join().unwrap();
     block_engine_forwarder.join();
 }
 
@@ -631,12 +665,14 @@ pub async fn shutdown_signal(exit: Arc<AtomicBool>) {
     warn!("signal received, starting graceful shutdown");
 }
 
-enum ValidatorStore {
+#[derive(Clone)]
+pub enum ValidatorStore {
     LeaderSchedule(LeaderScheduleUpdatingHandle),
     UserDefined(HashSet<Pubkey>),
 }
 
-struct ValidatorAutherImpl {
+#[derive(Clone)]
+pub struct ValidatorAutherImpl {
     store: ValidatorStore,
 }
 
@@ -647,6 +683,84 @@ impl ValidatorAuther for ValidatorAutherImpl {
             ValidatorStore::UserDefined(pubkeys) => pubkeys.contains(pubkey),
         }
     }
+}
+
+fn start_clusters_tpus_refresher(
+    rpc_load_balancer: &Arc<LoadBalancer>,
+    clusters_tpus: &ClustersTpus,
+    refresh_duration: Duration,
+    exit: &Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let rpc_load_balancer = rpc_load_balancer.clone();
+    let exit = exit.clone();
+    let clusters_tpus = clusters_tpus.clone();
+
+    thread::Builder::new()
+        .name("clusters_tpus_refresher".to_string())
+        .spawn(move || {
+            if let Err(e) = refresh_clusters_tpus(&rpc_load_balancer, &clusters_tpus) {
+                error!("error refreshing clusters tpus: {e:?}");
+            }
+
+            let tick_receiver = tick(Duration::from_secs(1));
+            let mut last_refresh = Instant::now();
+
+            while !exit.load(Ordering::Relaxed) {
+                let _ = tick_receiver.recv();
+                if last_refresh.elapsed() < refresh_duration {
+                    continue;
+                }
+
+                let now = Instant::now();
+                let refresh_result = refresh_clusters_tpus(&rpc_load_balancer, &clusters_tpus);
+                let updated_elapsed = now.elapsed().as_micros();
+                match refresh_result {
+                    Ok(_) => {
+                        datapoint_info!(
+                            "clusters_tpus_refresher-ok",
+                            ("count", 1, i64),
+                            ("clusters_tpus_size", clusters_tpus.len(), i64),
+                            ("updated_elapsed_us", updated_elapsed, i64),
+                        );
+                    }
+                    Err(e) => {
+                        datapoint_error!(
+                            "clusters_tpus_refresher-error",
+                            ("count", 1, i64),
+                            ("clusters_tpus_size", clusters_tpus.len(), i64),
+                            ("updated_elapsed_us", updated_elapsed, i64),
+                            ("error", e.to_string(), String),
+                        );
+                    }
+                }
+                last_refresh = Instant::now();
+            }
+        })
+        .unwrap()
+}
+
+fn refresh_clusters_tpus(
+    rpc_load_balancer: &Arc<LoadBalancer>,
+    clusters_tpus: &ClustersTpus,
+) -> solana_client::client_error::Result<()> {
+    let rpc_client = rpc_load_balancer.rpc_client();
+
+    let start = Instant::now();
+    let cluster_nodes = rpc_client.get_cluster_nodes()?;
+    info!(
+        "Fetched {} cluster nodes from RPC in {:?}",
+        cluster_nodes.len(),
+        start.elapsed()
+    );
+
+    for cluster_node in cluster_nodes {
+        clusters_tpus.insert(
+            Pubkey::from_str(&cluster_node.pubkey).unwrap(),
+            (cluster_node.tpu, cluster_node.tpu_quic),
+        );
+    }
+
+    Ok(())
 }
 
 fn start_lookup_table_refresher(

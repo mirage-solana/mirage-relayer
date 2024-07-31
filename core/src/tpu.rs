@@ -154,6 +154,7 @@ impl Tpu {
         for t in self.thread_handles {
             t.join()?
         }
+
         Ok(())
     }
 }

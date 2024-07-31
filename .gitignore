@@ -10,3 +10,8 @@
 
 .env
 docker-output/
+
+public.pem
+private.pem
+relayer-keypair.json
+jito-transaction-relayer

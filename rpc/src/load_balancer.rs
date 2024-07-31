@@ -1,10 +1,9 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
-    thread,
-    thread::{sleep, Builder, JoinHandle},
+    thread::{self, sleep, Builder, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -33,7 +32,7 @@ impl LoadBalancer {
     pub fn new(
         servers: &[(String, String)], /* http rpc url, ws url */
         exit: &Arc<AtomicBool>,
-    ) -> (LoadBalancer, Receiver<Slot>) {
+    ) -> (LoadBalancer, Receiver<Slot>, Arc<RwLock<u64>>) {
         let server_to_slot = Arc::new(DashMap::from_iter(
             servers.iter().map(|(_, ws)| (ws.clone(), 0)),
         ));
@@ -56,8 +55,15 @@ impl LoadBalancer {
 
         // sender tracked as health_manager-channel_stats.slot_sender_len
         let (slot_sender, slot_receiver) = crossbeam_channel::bounded(Self::SLOT_QUEUE_CAPACITY);
-        let subscription_threads =
-            Self::start_subscription_threads(servers, server_to_slot.clone(), slot_sender, exit);
+        let current_slot: Arc<RwLock<u64>> = Arc::new(RwLock::new(0));
+        let subscription_threads = Self::start_subscription_threads(
+            servers,
+            server_to_slot.clone(),
+            current_slot.clone(),
+            slot_sender.clone(),
+            exit,
+        );
+
         (
             LoadBalancer {
                 server_to_slot,
@@ -65,12 +71,14 @@ impl LoadBalancer {
                 subscription_threads,
             },
             slot_receiver,
+            current_slot,
         )
     }
 
     fn start_subscription_threads(
         servers: &[(String, String)],
         server_to_slot: Arc<DashMap<String, Slot>>,
+        current_slot: Arc<RwLock<u64>>,
         slot_sender: Sender<Slot>,
         exit: &Arc<AtomicBool>,
     ) -> Vec<JoinHandle<()>> {
@@ -89,6 +97,7 @@ impl LoadBalancer {
                 let server_to_slot = server_to_slot.clone();
                 let slot_sender = slot_sender.clone();
                 let highest_slot = highest_slot.clone();
+                let current_slot = current_slot.clone();
 
                 Builder::new()
                     .name(format!("load_balancer_subscription_thread-{ws_url_no_token}"))
@@ -116,12 +125,23 @@ impl LoadBalancer {
                                                 {
                                                     let old_slot = highest_slot.fetch_max(slot.slot, Ordering::Relaxed);
                                                     if slot.slot > old_slot {
+                                                        match current_slot.write() {
+                                                            Ok(mut write_slot) => {
+                                                                *write_slot = slot.slot;
+                                                            },
+                                                            Err(e) => {
+                                                                error!("current_slot.write() failed: {e}");
+                                                                break;
+                                                            }
+                                                        };
+
                                                         if let Err(e) = slot_sender.send(slot.slot)
                                                         {
                                                             error!("error sending slot: {e}");
                                                             break;
                                                         }
                                                     }
+
                                                 }
                                             }
                                             Err(RecvTimeoutError::Timeout) => {

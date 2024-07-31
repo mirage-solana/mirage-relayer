@@ -11,7 +11,7 @@ use std::{
 };
 
 use jito_rpc::load_balancer::LoadBalancer;
-use log::{debug, error};
+use log::{debug, error, info, warn};
 use solana_metrics::datapoint_info;
 use solana_sdk::{
     clock::{Slot, DEFAULT_SLOTS_PER_EPOCH},
@@ -20,15 +20,15 @@ use solana_sdk::{
 
 pub struct LeaderScheduleCacheUpdater {
     /// Maps slots to scheduled pubkey
-    schedules: Arc<RwLock<HashMap<Slot, Pubkey>>>,
+    pub schedules: Arc<RwLock<HashMap<Slot, Pubkey>>>,
 
     /// Refreshes leader schedule
-    refresh_thread: JoinHandle<()>,
+    pub refresh_thread: JoinHandle<()>,
 }
 
 #[derive(Clone)]
 pub struct LeaderScheduleUpdatingHandle {
-    schedule: Arc<RwLock<HashMap<Slot, Pubkey>>>,
+    pub schedule: Arc<RwLock<HashMap<Slot, Pubkey>>>,
 }
 
 /// Access handle to a constantly updating leader schedule
@@ -90,6 +90,7 @@ impl LeaderScheduleCacheUpdater {
             .name("leader-schedule-refresh".to_string())
             .spawn(move || {
                 while !exit.load(Ordering::Relaxed) {
+                    println!("Updating schedule");
                     let mut update_ok_count = 0;
                     let mut update_fail_count = 0;
 
@@ -97,6 +98,8 @@ impl LeaderScheduleCacheUpdater {
                         true => update_ok_count += 1,
                         false => update_fail_count += 1,
                     }
+
+                    println!("schedule: {:?}", schedule.read().unwrap());
 
                     let slots_in_schedule = schedule.read().unwrap().len();
 
@@ -107,7 +110,7 @@ impl LeaderScheduleCacheUpdater {
                         ("slots_in_schedule", slots_in_schedule, i64),
                     );
 
-                    sleep(Duration::from_secs(10));
+                    sleep(Duration::from_secs(1));
                 }
             })
             .unwrap()
