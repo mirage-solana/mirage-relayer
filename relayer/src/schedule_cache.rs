@@ -90,7 +90,6 @@ impl LeaderScheduleCacheUpdater {
             .name("leader-schedule-refresh".to_string())
             .spawn(move || {
                 while !exit.load(Ordering::Relaxed) {
-                    println!("Updating schedule");
                     let mut update_ok_count = 0;
                     let mut update_fail_count = 0;
 
@@ -98,8 +97,6 @@ impl LeaderScheduleCacheUpdater {
                         true => update_ok_count += 1,
                         false => update_fail_count += 1,
                     }
-
-                    println!("schedule: {:?}", schedule.read().unwrap());
 
                     let slots_in_schedule = schedule.read().unwrap().len();
 
